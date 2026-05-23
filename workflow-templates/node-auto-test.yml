@@ -1,0 +1,105 @@
+﻿name: Auto Test Generation â€” Node / Express
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - develop
+      - "release/**"
+      - "feature/**"
+
+# Cancel in-progress runs for the same PR on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write       # needed to commit generated test files
+  pull-requests: write  # needed to post PR comments
+  issues: write         # needed to update PR comments
+
+jobs:
+  auto-test-gen:
+    name: Generate and Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      # Spin up a Redis instance for BullMQ queue tests
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # â”€â”€ Checkout PR branch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # â”€â”€ Setup Node.js â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      # â”€â”€ Install project dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Install project dependencies
+        run: npm ci
+        continue-on-error: true
+
+      # â”€â”€ Set environment variables for test run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Set test environment variables
+        run: |
+          echo "NODE_ENV=test"                    >> $GITHUB_ENV
+          echo "JWT_SECRET=test_secret_key_ci"   >> $GITHUB_ENV
+          echo "REDIS_URL=redis://localhost:6379" >> $GITHUB_ENV
+          echo "MONGODB_URI=mongodb://localhost:27017/zyloch_test" >> $GITHUB_ENV
+
+      # â”€â”€ Start MongoDB for integration tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Start MongoDB
+        uses: supercharge/mongodb-github-action@1.11.0
+        with:
+          mongodb-version: "7.0"
+          mongodb-db: "zyloch_test"
+        continue-on-error: true   # unit tests mock DB â€” don't fail if mongo unavailable
+
+      # â”€â”€ Run composite action from utility-commons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Run Auto Test Generation
+        uses: Rich01267-tech/utility-commons/.github/actions/auto-test-gen@main
+        with:
+          openai_api_key:       ${{ secrets.OPENAI_API_KEY }}
+          github_token:         ${{ secrets.GITHUB_TOKEN }}
+          service_type:         "node"
+          repo_type:            "individual"
+          coverage_threshold:   "80"
+          fail_on_test_failure: "true"
+          output_mode:          "comment"
+          openai_model:         "gpt-4.1"
+          max_tokens:           "4000"
+          test_output_dir:      "__generated_tests__"
+        env:
+          NODE_ENV:     test
+          JWT_SECRET:   test_secret_key_ci
+          REDIS_URL:    redis://localhost:6379
+          MONGODB_URI:  mongodb://localhost:27017/zyloch_test
+
+      # â”€â”€ Upload generated tests as artifact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Upload generated tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests-node-pr-${{ github.event.pull_request.number }}
+          path: __generated_tests__/
+          retention-days: 7
+          if-no-files-found: warn

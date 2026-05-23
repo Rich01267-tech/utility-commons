@@ -1,0 +1,173 @@
+﻿name: Auto Test Generation â€” FastAPI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+      - develop
+      - "release/**"
+      - "feature/**"
+
+# Cancel in-progress runs for the same PR on new push
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write       # needed to commit generated test files
+  pull-requests: write  # needed to post PR comments
+  issues: write         # needed to update PR comments
+
+jobs:
+  auto-test-gen:
+    name: Generate and Run Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      # MongoDB for integration tests
+      mongodb:
+        image: mongo:7.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # â”€â”€ Checkout PR branch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # â”€â”€ Setup Python â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # â”€â”€ Install project dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Install project dependencies
+        run: |
+          pip install --upgrade pip
+          pip install --require-hashes -r requirements.txt
+        continue-on-error: true   # don't fail if hash pinning needs setup
+
+      # â”€â”€ Install test dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Install test dependencies
+        run: |
+          pip install \
+            pytest \
+            pytest-asyncio \
+            pytest-cov \
+            pytest-json-report \
+            httpx \
+            python-jose \
+            python-multipart
+        continue-on-error: false
+
+      # â”€â”€ Install YARA dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Install YARA system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev \
+            libmagic-dev
+        continue-on-error: true   # YARA optional â€” scanner tests mock it
+
+      # â”€â”€ Set environment variables for test run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Set test environment variables
+        run: |
+          echo "ENVIRONMENT=test"                                      >> $GITHUB_ENV
+          echo "JWT_SECRET=test_secret_key_ci"                        >> $GITHUB_ENV
+          echo "JWT_ALGORITHM=HS256"                                   >> $GITHUB_ENV
+          echo "JWT_AUDIENCE=zyloch-api"                              >> $GITHUB_ENV
+          echo "MONGODB_URI=mongodb://localhost:27017/zyloch_test"    >> $GITHUB_ENV
+          echo "MONGODB_DB_NAME=zyloch_test"                          >> $GITHUB_ENV
+          echo "ANTHROPIC_API_KEY=sk-test-placeholder-not-real"       >> $GITHUB_ENV
+          echo "OPENAI_API_KEY=sk-test-placeholder-not-real"          >> $GITHUB_ENV
+          echo "GOOGLE_GENAI_API_KEY=test-placeholder-not-real"       >> $GITHUB_ENV
+          echo "GCP_DLP_PROJECT=test-project"                        >> $GITHUB_ENV
+          echo "GITHUB_APP_ID=test_app_id"                            >> $GITHUB_ENV
+          echo "GITHUB_WEBHOOK_SECRET=test_webhook_secret_ci"        >> $GITHUB_ENV
+          echo "FIELD_ENCRYPTION_KEY=dGVzdF9lbmNyeXB0aW9uX2tleV9jaQ==" >> $GITHUB_ENV
+
+      # â”€â”€ Create pytest configuration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Create pytest configuration
+        run: |
+          cat > pytest.ini << 'EOF'
+          [pytest]
+          asyncio_mode = auto
+          testpaths = __generated_tests__
+          python_files = test_*.py
+          python_classes = Test*
+          python_functions = test_*
+          addopts =
+            --tb=short
+            --no-header
+            -v
+            --cov=.
+            --cov-report=json:coverage.json
+            --cov-report=term-missing
+            --json-report
+            --json-report-file=pytest_report.json
+            -p no:warnings
+          EOF
+
+      # â”€â”€ Run composite action from utility-commons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Run Auto Test Generation
+        uses: Rich01267-tech/utility-commons/.github/actions/auto-test-gen@main
+        with:
+          openai_api_key:       ${{ secrets.OPENAI_API_KEY }}
+          github_token:         ${{ secrets.GITHUB_TOKEN }}
+          service_type:         "fastapi"
+          repo_type:            "individual"
+          coverage_threshold:   "80"
+          fail_on_test_failure: "true"
+          output_mode:          "comment"
+          openai_model:         "gpt-4.1"
+          max_tokens:           "4000"
+          test_output_dir:      "__generated_tests__"
+        env:
+          ENVIRONMENT:            test
+          JWT_SECRET:             test_secret_key_ci
+          JWT_ALGORITHM:          HS256
+          JWT_AUDIENCE:           zyloch-api
+          MONGODB_URI:            mongodb://localhost:27017/zyloch_test
+          MONGODB_DB_NAME:        zyloch_test
+          ANTHROPIC_API_KEY:      sk-test-placeholder-not-real
+          OPENAI_API_KEY:         sk-test-placeholder-not-real
+          GOOGLE_GENAI_API_KEY:   test-placeholder-not-real
+          GCP_DLP_PROJECT:        test-project
+          GITHUB_APP_ID:          test_app_id
+          GITHUB_WEBHOOK_SECRET:  test_webhook_secret_ci
+          FIELD_ENCRYPTION_KEY:   dGVzdF9lbmNyeXB0aW9uX2tleV9jaQ==
+
+      # â”€â”€ Upload generated tests as artifact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Upload generated tests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tests-fastapi-pr-${{ github.event.pull_request.number }}
+          path: __generated_tests__/
+          retention-days: 7
+          if-no-files-found: warn
+
+      # â”€â”€ Upload coverage report as artifact â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-fastapi-pr-${{ github.event.pull_request.number }}
+          path: |
+            coverage.json
+            pytest_report.json
+          retention-days: 7
+          if-no-files-found: warn

@@ -1,0 +1,228 @@
+name: "Auto Test Case Generator"
+description: "Automatically generates, runs, and reports test cases for code changes in a PR using OpenAI Codex CLI. Supports Next.js, Node/Express, and FastAPI services in both monorepo and individual repo setups."
+
+author: "Zyloch Platform"
+
+inputs:
+  openai_api_key:
+    description: "OpenAI API key for Codex CLI authentication"
+    required: true
+
+  github_token:
+    description: "GitHub token for posting PR comments and reading PR diff"
+    required: true
+
+  service_type:
+    description: "Type of service being tested. Options: nextjs | node | fastapi | auto"
+    required: false
+    default: "auto"
+
+  repo_type:
+    description: "Repository structure type. Options: monorepo | individual"
+    required: false
+    default: "individual"
+
+  monorepo_services:
+    description: "Comma-separated list of service directories in a monorepo. Example: frontend,backend,api"
+    required: false
+    default: ""
+
+  coverage_threshold:
+    description: "Minimum coverage percentage required to pass. PR fails if coverage drops below this."
+    required: false
+    default: "80"
+
+  fail_on_test_failure:
+    description: "Fail the PR if any generated test case fails execution."
+    required: false
+    default: "true"
+
+  output_mode:
+    description: "How to deliver results. Options: comment | commit | both"
+    required: false
+    default: "comment"
+
+  test_output_dir:
+    description: "Directory to write generated test files to when output_mode is commit or both."
+    required: false
+    default: "__generated_tests__"
+
+  openai_model:
+    description: "OpenAI model to use for test generation."
+    required: false
+    default: "gpt-4.1"
+
+  max_tokens:
+    description: "Maximum tokens per Codex API call."
+    required: false
+    default: "4000"
+
+outputs:
+  tests_generated:
+    description: "Total number of test cases generated in this run."
+    value: ${{ steps.generate.outputs.tests_generated }}
+
+  tests_passed:
+    description: "Number of generated test cases that passed execution."
+    value: ${{ steps.run_tests.outputs.tests_passed }}
+
+  tests_failed:
+    description: "Number of generated test cases that failed execution."
+    value: ${{ steps.run_tests.outputs.tests_failed }}
+
+  coverage_percentage:
+    description: "Overall code coverage percentage after running generated tests."
+    value: ${{ steps.run_tests.outputs.coverage_percentage }}
+
+  report_url:
+    description: "URL of the PR comment containing the full test report."
+    value: ${{ steps.post_comment.outputs.report_url }}
+
+runs:
+  using: "composite"
+
+  steps:
+
+    # ── Step 1: Setup Python environment ────────────────────────────────────
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # ── Step 2: Install dependencies ─────────────────────────────────────────
+    - name: Install Python dependencies
+      shell: bash
+      run: |
+        pip install --upgrade pip
+        pip install \
+          openai \
+          pytest \
+          pytest-cov \
+          pytest-asyncio \
+          httpx \
+          requests \
+          pygithub \
+          PyYAML
+
+    # ── Step 3: Install Node.js test dependencies (for Next.js and Node) ─────
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install Node.js test dependencies
+      shell: bash
+      run: |
+        npm install -g \
+          jest \
+          @testing-library/react \
+          @testing-library/jest-dom \
+          @testing-library/user-event \
+          ts-jest \
+          typescript
+
+    # ── Step 4: Parse PR diff and detect service type ────────────────────────
+    - name: Parse PR diff and detect services
+      id: parse
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO_FULL_NAME: ${{ github.repository }}
+        SERVICE_TYPE: ${{ inputs.service_type }}
+        REPO_TYPE: ${{ inputs.repo_type }}
+        MONOREPO_SERVICES: ${{ inputs.monorepo_services }}
+      run: |
+        python ${{ github.action_path }}/parse_diff.py
+
+    # ── Step 5: Generate test cases using OpenAI Codex ───────────────────────
+    - name: Generate test cases
+      id: generate
+      shell: bash
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        OPENAI_MODEL: ${{ inputs.openai_model }}
+        MAX_TOKENS: ${{ inputs.max_tokens }}
+        DIFF_OUTPUT: ${{ steps.parse.outputs.diff_output }}
+        DETECTED_SERVICES: ${{ steps.parse.outputs.detected_services }}
+        ACTION_PATH: ${{ github.action_path }}
+        TEST_OUTPUT_DIR: ${{ inputs.test_output_dir }}
+      run: |
+        python ${{ github.action_path }}/generate_tests.py
+
+    # ── Step 6: Run generated test cases ─────────────────────────────────────
+    - name: Run generated test cases
+      id: run_tests
+      shell: bash
+      env:
+        TEST_OUTPUT_DIR: ${{ inputs.test_output_dir }}
+        DETECTED_SERVICES: ${{ steps.parse.outputs.detected_services }}
+        COVERAGE_THRESHOLD: ${{ inputs.coverage_threshold }}
+        FAIL_ON_TEST_FAILURE: ${{ inputs.fail_on_test_failure }}
+      run: |
+        python ${{ github.action_path }}/run_tests.py
+
+    # ── Step 7: Post PR comment with full report ──────────────────────────────
+    - name: Post test report as PR comment
+      id: post_comment
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO_FULL_NAME: ${{ github.repository }}
+        TESTS_GENERATED: ${{ steps.generate.outputs.tests_generated }}
+        TESTS_PASSED: ${{ steps.run_tests.outputs.tests_passed }}
+        TESTS_FAILED: ${{ steps.run_tests.outputs.tests_failed }}
+        COVERAGE_PERCENTAGE: ${{ steps.run_tests.outputs.coverage_percentage }}
+        COVERAGE_THRESHOLD: ${{ inputs.coverage_threshold }}
+        TEST_REPORT: ${{ steps.run_tests.outputs.test_report }}
+        OUTPUT_MODE: ${{ inputs.output_mode }}
+      run: |
+        python ${{ github.action_path }}/post_comment.py
+
+    # ── Step 8: Commit generated test files if output_mode includes commit ────
+    - name: Commit generated test files
+      if: inputs.output_mode == 'commit' || inputs.output_mode == 'both'
+      shell: bash
+      env:
+        TEST_OUTPUT_DIR: ${{ inputs.test_output_dir }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        git config --global user.name "auto-test-gen[bot]"
+        git config --global user.email "auto-test-gen[bot]@users.noreply.github.com"
+        git add ${{ inputs.test_output_dir }}/
+        git diff --cached --quiet || git commit -m "chore: add auto-generated test cases [skip ci]"
+        git push
+
+    # ── Step 9: Enforce failure conditions ───────────────────────────────────
+    - name: Enforce test and coverage gates
+      shell: bash
+      env:
+        TESTS_FAILED: ${{ steps.run_tests.outputs.tests_failed }}
+        COVERAGE_PERCENTAGE: ${{ steps.run_tests.outputs.coverage_percentage }}
+        COVERAGE_THRESHOLD: ${{ inputs.coverage_threshold }}
+        FAIL_ON_TEST_FAILURE: ${{ inputs.fail_on_test_failure }}
+      run: |
+        python -c "
+        import os, sys
+
+        tests_failed = int(os.environ.get('TESTS_FAILED', '0'))
+        coverage = float(os.environ.get('COVERAGE_PERCENTAGE', '0'))
+        threshold = float(os.environ.get('COVERAGE_THRESHOLD', '80'))
+        fail_on_failure = os.environ.get('FAIL_ON_TEST_FAILURE', 'true').lower() == 'true'
+
+        failed = False
+
+        if fail_on_failure and tests_failed > 0:
+            print(f'FAIL: {tests_failed} test case(s) failed. PR cannot be merged.')
+            failed = True
+
+        if coverage < threshold:
+            print(f'FAIL: Coverage {coverage:.1f}% is below the required threshold of {threshold}%.')
+            failed = True
+
+        if failed:
+            sys.exit(1)
+
+        print(f'PASS: All tests passed. Coverage {coverage:.1f}% meets the threshold of {threshold}%.')
+        "
